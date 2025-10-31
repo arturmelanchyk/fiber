@@ -2297,3 +2297,53 @@ func Benchmark_Client_Request_Parallel(b *testing.B) {
 		require.NoError(b, err)
 	})
 }
+
+func Benchmark_Client_Request_Send_ContextCancel(b *testing.B) {
+	app, ln, start := createHelperServer(b)
+
+	startedCh := make(chan struct{})
+
+	app.Post("/", func(c fiber.Ctx) error {
+		startedCh <- struct{}{}
+		time.Sleep(time.Millisecond) // let cancel be called
+		return c.Status(fiber.StatusOK).SendString("post")
+	})
+
+	go start()
+
+	client := New().SetDial(ln)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for b.Loop() {
+		ctx, cancel := context.WithCancel(context.Background())
+
+		req := AcquireRequest().
+			SetClient(client).
+			SetURL("http://example.com").
+			SetMethod(fiber.MethodPost).
+			SetContext(ctx)
+
+		errCh := make(chan error)
+		respCh := make(chan *Response)
+
+		go func(r *Request) {
+			defer close(errCh)
+			defer close(respCh)
+
+			defer ReleaseRequest(r)
+
+			resp, err := r.Send()
+
+			errCh <- err
+			respCh <- resp
+		}(req)
+
+		<-startedCh // request is made, we can cancel the context now
+		cancel()
+
+		require.ErrorIs(b, <-errCh, ErrTimeoutOrCancel)
+		require.Nil(b, <-respCh)
+	}
+}
