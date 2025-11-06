@@ -88,18 +88,17 @@ func New(config ...Config) fiber.Handler {
 	}
 
 	var (
-		// Cache settings
-		mux       = &sync.RWMutex{}
 		timestamp = uint64(time.Now().Unix()) //nolint:gosec //Not a concern
-	)
-	// Create manager to simplify storage operations ( see manager.go )
-	manager := newManager(cfg.Storage, redactKeys)
-	// Create indexed heap for tracking expirations ( see heap.go )
-	heap := &indexedHeap{}
-	// count stored bytes (sizes of response bodies)
-	var storedBytes uint
 
-	// Update timestamp in the configured interval
+		mux         = &sync.RWMutex{} // mutex for locking entities below
+		heap        = &indexedHeap{}  // indexed heap for tracking expirations (see heap.go)
+		storedBytes = uint(0)         // count stored bytes (sizes of response bodies)
+	)
+
+	// Create a manager to simplify storage operations (see manager.go)
+	manager := newManager(cfg.Storage, redactKeys)
+
+	// Update the timestamp in the configured interval
 	go func() {
 		ticker := time.NewTicker(timestampUpdatePeriod)
 		defer ticker.Stop()
@@ -113,7 +112,7 @@ func New(config ...Config) fiber.Handler {
 		if err := manager.del(ctx, dkey); err != nil {
 			return err
 		}
-		// External storage saves body data with different key
+		// External storage saves body data with a different key
 		if cfg.Storage != nil {
 			if err := manager.del(ctx, dkey+"_body"); err != nil {
 				return err
@@ -143,14 +142,11 @@ func New(config ...Config) fiber.Handler {
 
 		reqCtx := c.Context()
 
-		// Get entry from pool
+		// Get entry from the pool
 		e, err := manager.get(reqCtx, key)
 		if err != nil && !errors.Is(err, errCacheMiss) {
 			return err
 		}
-
-		// Lock entry
-		mux.Lock()
 
 		// Get timestamp
 		ts := atomic.LoadUint64(&timestamp)
@@ -168,14 +164,15 @@ func New(config ...Config) fiber.Handler {
 					if e != nil {
 						manager.release(e)
 					}
-					mux.Unlock()
 					return fmt.Errorf("cache: failed to delete expired key %q: %w", maskKey(key), err)
 				}
 				idx := e.heapidx
 				manager.release(e)
 				if cfg.MaxBytes > 0 {
+					mux.Lock()
 					_, size := heap.remove(idx)
 					storedBytes -= size
+					mux.Unlock()
 				}
 			} else if e.exp != 0 && !hasRequestDirective(c, noCache) {
 				// Separate body value to avoid msgp serialization
@@ -184,12 +181,11 @@ func New(config ...Config) fiber.Handler {
 					rawBody, err := manager.getRaw(reqCtx, key+"_body")
 					if err != nil {
 						manager.release(e)
-						mux.Unlock()
 						return cacheBodyFetchError(maskKey, key, err)
 					}
 					e.body = rawBody
 				}
-				// Set response headers from cache
+				// Set response headers from the cache
 				c.Response().SetBodyRaw(e.body)
 				c.Response().SetStatusCode(e.status)
 				c.Response().Header.SetContentTypeBytes(e.ctype)
@@ -217,15 +213,10 @@ func New(config ...Config) fiber.Handler {
 					manager.release(e)
 				}
 
-				mux.Unlock()
-
 				// Return response
 				return nil
 			}
 		}
-
-		// make sure we're not blocking concurrent requests - do unlock
-		mux.Unlock()
 
 		// Continue stack, return err to Fiber if exist
 		if err := c.Next(); err != nil {
